@@ -1,0 +1,56 @@
+#!/usr/bin/perl
+
+use strict;
+use POSIX;
+use File::stat;
+use Digest::SHA;
+
+my @dir = qw(/);
+
+sub perms {
+	local $_ = shift;
+	return sprintf('%04o', $_ & 07777);
+}
+
+sub mtime {
+	local $_ = shift;
+	return &strftime('%Y-%m-%d-%H-%M-%S', localtime($_));
+}
+
+sub process_dir {
+	my $dir = shift;
+	opendir(DIR, $dir) or die "opendir $dir: $!";
+	foreach (map { $dir eq "/" ? "/$_" : "$dir/$_" } grep { !/^\.\.?$/ } readdir(DIR)) {
+		my @row = ($_);
+		my $stat = lstat($_);
+		if (-l) {
+			push (@row, 'L', &perms($stat->mode), $stat->uid, $stat->gid);
+			push (@row, readlink);
+		}
+		elsif (-f) {
+			push (@row, 'F', &perms($stat->mode), $stat->uid, $stat->gid);
+			my $sha = Digest::SHA->new;
+			$sha->addfile($_);
+			push (@row, $sha->hexdigest);
+		}
+		elsif (-d) {
+			push (@row, 'D', &perms($stat->mode), $stat->uid, $stat->gid);
+			push (@dir, $_);
+		}
+		else {
+			push (@row, '?', &perms($stat->mode), $stat->uid, $stat->gid);
+		}
+		print join("\t", @row);
+		print "\n";
+	}
+	closedir(DIR);
+}
+
+printf STDERR (qq(%s - starting run\n), &strftime('%Y-%m-%d-%H-%M-%S', localtime));
+
+while (my $dir = shift @dir) {
+	next if (grep { $dir eq $_ } qw(/root /home /var /tmp /dev /sys /proc /run /net /mnt /media));
+	&process_dir($dir);
+}
+
+printf STDERR (qq(%s - done\n), &strftime('%Y-%m-%d-%H-%M-%S', localtime));

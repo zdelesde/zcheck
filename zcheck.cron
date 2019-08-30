@@ -1,0 +1,2 @@
+#!/bin/bash
+/usr/bin/ionice -c3 /usr/local/sbin/zcheck 2> /var/log/zcheck | sort > /var/lib/zcheck.$(date +%Y%m%d-%H%M%S) 2>&1
