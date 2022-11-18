@@ -29,7 +29,7 @@ sub process_dir {
 		}
 		elsif (-f) {
 			push (@row, 'F', &perms($stat->mode), $stat->uid, $stat->gid);
-			my $sha = Digest::SHA->new;
+			my $sha = Digest::SHA->new('256');
 			$sha->addfile($_);
 			push (@row, $sha->hexdigest);
 		}
