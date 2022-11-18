@@ -1,0 +1,8 @@
+#!/bin/bash
+LATEST=$(date +%Y%m%d-%H%M%S)
+if which dpkg > /dev/null; then
+	dpkg --list > /var/lib/packages/$LATEST 2>&1
+elif which rpm > /dev/null; then
+	rpm -qa 2> /dev/null | sort > /var/lib/packages/$LATEST
+fi
+cp /var/lib/packages/$LATEST /var/lib/packages/latest

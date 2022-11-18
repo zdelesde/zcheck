@@ -1,2 +1,4 @@
 #!/bin/bash
-/usr/bin/ionice -c3 /usr/local/sbin/zcheck 2> /var/log/zcheck | sort > /var/lib/zcheck.$(date +%Y%m%d-%H%M%S) 2>&1
+LATEST=$(date +%Y%m%d-%H%M%S)
+ionice -c3 /usr/local/sbin/zcheck 2> /var/log/zcheck | sort > /var/lib/zcheck/$LATEST 2>&1
+cp /var/lib/zcheck/$LATEST /var/lib/zcheck/latest
