@@ -28,5 +28,3 @@ root@animal:/var/lib/zcheck# diff 20201115-064708 20201122-064710
 ```
 
 Another script is included that makes a manifest of installed packages.
-
-Note: this script *assumes* that the script itself, the Digest::SHA perl module and any dependencies have not been tampered with.
