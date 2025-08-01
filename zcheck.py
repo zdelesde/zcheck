@@ -2,6 +2,8 @@
 
 import logging
 import os
+import pwd
+import grp
 import hashlib
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%Y-%m-%d-%H-%M-%S')
@@ -27,27 +29,27 @@ def process_dir(d):
             if entry.is_symlink():
                 row.append("L")
                 row.append(oct(st.st_mode)[-4:])
-                row.append(st.st_uid)
-                row.append(st.st_gid)
+                row.append(pwd.getpwuid(st.st_uid).pw_name)
+                row.append(grp.getgrgid(st.st_gid).gr_name)
                 row.append(os.readlink(entry.path))
             elif entry.is_file():
                 row.append("F")
                 row.append(oct(st.st_mode)[-4:])
-                row.append(st.st_uid)
-                row.append(st.st_gid)
+                row.append(pwd.getpwuid(st.st_uid).pw_name)
+                row.append(grp.getgrgid(st.st_gid).gr_name)
                 row.append(sha256_of_file(entry.path))
 
             elif entry.is_dir():
                 row.append("D")
                 row.append(oct(st.st_mode)[-4:])
-                row.append(st.st_uid)
-                row.append(st.st_gid)
+                row.append(pwd.getpwuid(st.st_uid).pw_name)
+                row.append(grp.getgrgid(st.st_gid).gr_name)
                 dirs.append(entry.path)
             else:
                 row.append("?")
                 row.append(oct(st.st_mode)[-4:])
-                row.append(st.st_uid)
-                row.append(st.st_gid)
+                row.append(pwd.getpwuid(st.st_uid).pw_name)
+                row.append(grp.getgrgid(st.st_gid).gr_name)
                 
             print("\t".join(map(str, row)))
 
