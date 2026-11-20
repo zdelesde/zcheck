@@ -1,0 +1,19 @@
+#!/usr/bin/python3 -I
+"""zcheck - filesystem integrity inventory. See `zcheck --help`."""
+
+import os
+import sys
+
+# -I keeps PYTHONPATH, user site-packages and the current directory out of
+# the import path, so the module is loaded from an explicit location only.
+# Installed copies have LIBDIR filled in; a source checkout uses ../lib.
+LIBDIR = "@LIBDIR@"
+if LIBDIR.startswith("@"):
+    LIBDIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib")
+
+sys.dont_write_bytecode = True   # no unowned __pycache__ next to package files
+sys.path.insert(0, LIBDIR)
+
+from zcheck.cli import main  # noqa: E402
+
+sys.exit(main())

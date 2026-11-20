@@ -1,0 +1,208 @@
+import io
+import os
+import types
+import unittest
+
+from helpers import TreeCase, write
+from zcheck.compare import (Classifier, audit, audit_command, diff, diff_command, field_changes,
+                            open_runs, owner_line)
+from zcheck.config import Config
+
+
+def entry(**kw):
+    e = dict(type="F", mode=0o644, uid=0, gid=0, size=1, sha256="a" * 64, target=None,
+             rdev=None, fstype=None, md5_status=None, conffile=0, path_text="/x")
+    e.update(kw)
+    return e
+
+
+class Classify(unittest.TestCase):
+    def cls(self, rules=(), old=None, new=None):
+        default = {"pkga": "1", "pkgb": "1"}
+        return Classifier(list(rules), default if old is None else old, default if new is None else new)
+
+    def test_setuid_added(self):
+        k, why, rule = self.cls().classify("/usr/bin/x", entry(), entry(mode=0o4755), ["pkga"], ["pkga"])
+        self.assertEqual((k, rule), ("alarm", None))
+        self.assertIn("setuid", why)
+        k, _, _ = self.cls().classify("/usr/bin/x", None, entry(mode=0o2755), [], [])
+        self.assertEqual(k, "alarm")
+
+    def test_existing_setuid_is_not_an_addition(self):
+        cls = self.cls(old={"pkga": "1"}, new={"pkga": "2"})
+        k, _, _ = cls.classify("/usr/bin/su", entry(mode=0o4755), entry(mode=0o4755, sha256="b" * 64),
+                               ["pkga"], ["pkga"])
+        self.assertEqual(k, "explained")
+
+    def test_checksum_mismatch_beats_package_upgrade(self):
+        cls = self.cls(old={"pkga": "1"}, new={"pkga": "2"})
+        k, _, _ = cls.classify("/usr/bin/x", entry(), entry(md5_status="modified"), ["pkga"], ["pkga"])
+        self.assertEqual(k, "alarm")
+
+    def test_package_upgrade_explains(self):
+        cls = self.cls(old={"pkga": "1"}, new={"pkga": "2"})
+        k, why, _ = cls.classify("/usr/bin/x", entry(), entry(sha256="b" * 64, md5_status="ok"),
+                                 ["pkga"], ["pkga"])
+        self.assertEqual(k, "explained")
+        self.assertIn("pkga 1->2", why)
+
+    def test_package_removal_explains_removed_files(self):
+        cls = self.cls(old={"pkga": "1"}, new={})
+        self.assertEqual(cls.classify("/usr/bin/x", entry(), None, ["pkga"], [])[0], "explained")
+
+    def test_owned_but_unchanged_package(self):
+        k, why, _ = self.cls().classify("/usr/bin/x", entry(), entry(sha256="b" * 64), ["pkga"], ["pkga"])
+        self.assertEqual(k, "alarm")
+        self.assertIn("didn't change", why)
+
+    def test_unowned(self):
+        self.assertEqual(self.cls().classify("/usr/local/bin/x", None, entry(), [], [])[0], "alarm")
+
+    def test_device_node_outside_dev(self):
+        k, _, _ = self.cls().classify("/usr/bin/x", None, entry(type="C", rdev="1:3"), [], [])
+        self.assertEqual(k, "alarm")
+
+    def test_conffiles_are_notices(self):
+        k, _, _ = self.cls().classify("/etc/a.conf", entry(conffile=1, md5_status="ok"),
+                                      entry(conffile=1, md5_status="modified"), ["pkga"], ["pkga"])
+        self.assertEqual(k, "notice")
+
+    def test_alternatives(self):
+        old, new = entry(type="L", target=b"/a"), entry(type="L", target=b"/b")
+        self.assertEqual(self.cls().classify("/usr/bin/ed", old, new, ["(alternatives:ed)"],
+                                             ["(alternatives:ed)"])[0], "notice")
+        cls = self.cls(old={"pkga": "1"}, new={"pkga": "2"})
+        self.assertEqual(cls.classify("/usr/bin/ed", old, new, ["(alternatives:ed)"],
+                                      ["(alternatives:ed)"])[0], "explained")
+
+    def test_generated_default_rule(self):
+        pyc = "/usr/lib/python3/dist-packages/m/__pycache__/m.pyc"
+        k, _, rule = self.cls().classify(pyc, None, entry(), [], [])
+        self.assertEqual(k, "alarm")                 # no package changed
+        self.assertIn("(default)", rule)
+        cls = self.cls(old={"pkga": "1"}, new={"pkga": "2"})
+        self.assertEqual(cls.classify(pyc, None, entry(), [], [])[0], "explained")
+
+    def test_etc_default_notice(self):
+        self.assertEqual(self.cls().classify("/etc/hostname", entry(), entry(sha256="b" * 64), [], [])[0],
+                         "notice")
+
+    def test_config_rules_come_first(self):
+        cls = self.cls(rules=[("ignore", "/opt"), ("notice", "/opt/*"), ("alarm", "/etc/sudoers")])
+        self.assertEqual(cls.classify("/opt", None, entry(type="D"), [], [])[0], "ignore")
+        k, _, rule = cls.classify("/opt/app/bin", None, entry(mode=0o4755), [], [])
+        self.assertEqual((k, rule), ("notice", "notice /opt/* (config)"))
+        self.assertEqual(cls.classify("/etc/sudoers", entry(conffile=1), entry(conffile=1, sha256="b"),
+                                      ["sudo"], ["sudo"])[0], "alarm")
+
+
+class Formatting(unittest.TestCase):
+    def test_field_changes(self):
+        o = entry(md5_status="ok", type="L", target=b"/a")
+        n = entry(mode=0o4755, uid=1000, md5_status="modified", type="L", target=b"/b", sha256="b" * 64)
+        self.assertEqual(field_changes(o, n),
+                         ["mode 0644->4755", "uid 0->1000", "content", "target /a->/b",
+                          "checksum ok->mismatch"])
+        self.assertEqual(field_changes(entry(sha256=None, size=1), entry(sha256=None, size=9)), ["size 1->9"])
+
+    def test_owner_line(self):
+        old, new = {"a": "1", "b": "1", "c": "1"}, {"a": "2", "b": "1", "d": "1"}
+        self.assertEqual(owner_line(["a"], old, new, entry(md5_status="ok")), "a 1 -> 2 (checksum ok)")
+        self.assertEqual(owner_line(["c"], old, new, None), "c 1 (removed)")
+        self.assertEqual(owner_line(["d"], old, new, None), "d 1 (newly installed)")
+        self.assertEqual(owner_line([], old, new, entry()), "none")
+        self.assertEqual(owner_line(["b"], old, new, entry(conffile=1, md5_status="modified")),
+                         "b 1 (conffile, modified)")
+        self.assertEqual(owner_line(["a", "b", "c", "d"], old, new, None),
+                         "a 1 -> 2, b 1, c 1 (removed), +1 more")
+
+
+class EndToEnd(TreeCase):
+    """Two real scans of a tree with package upgrades and tampering in between."""
+
+    def setUp(self):
+        super().setUp()
+        for f in ("usr/bin/tool", "usr/bin/other", "usr/bin/mine"):
+            write(self.t(f), f)
+        write(self.t("etc/app.conf"), "conf")
+        self.fake.add("pkga", "1.0", files=[self.t("usr/bin/tool")], md5=[self.t("usr/bin/tool")],
+                      conffiles=[self.t("etc/app.conf")])
+        self.fake.add("pkgb", "1.0", files=[self.t("usr/bin/other")], md5=[self.t("usr/bin/other")])
+        self.old = self.scan()
+
+        write(self.t("usr/bin/tool"), "tool v2")                      # upgrade
+        self.fake.add("pkga", "2.0", files=[self.t("usr/bin/tool")], md5=[self.t("usr/bin/tool")],
+                      conffiles=[self.t("etc/app.conf")])
+        self.fake.write()
+        write(self.t("usr/bin/other"), "tampered")                    # tamper, pkgb unchanged
+        os.chmod(self.t("usr/bin/mine"), 0o4755)                      # setuid on unowned
+        write(self.t("usr/bin/dropped"), "new")                       # new unowned
+        write(self.t("etc/app.conf"), "edited")                       # edit conffile
+        write(self.t("usr/lib/py/__pycache__/m.pyc"), "pyc")          # generated
+        self.new = self.scan()
+
+    def classes(self, rules=()):
+        db = open_runs(self.new, self.old)
+        from zcheck.compare import packages
+        cls = Classifier(list(rules), packages(db, "o"), packages(db, "main"))
+        return {c["path"][len(self.tree):]: c for c in diff(db, cls)}
+
+    def test_diff_classes(self):
+        c = self.classes()
+        expect = {
+            "/usr/bin/tool": "explained", "/usr/bin/other": "alarm", "/usr/bin/mine": "alarm",
+            "/usr/bin/dropped": "alarm", "/etc/app.conf": "notice",
+            "/usr/lib/py/__pycache__/m.pyc": "explained",
+        }
+        for path, klass in expect.items():
+            with self.subTest(path=path):
+                self.assertEqual(c[path]["class"], klass)
+        self.assertEqual(c["/usr/bin/tool"]["owner"], "pkga 1.0 -> 2.0 (checksum ok)")
+        self.assertEqual(c["/usr/bin/other"]["detail"], "content, checksum ok->mismatch")
+
+    def test_diff_command_exit_and_output(self):
+        args = types.SimpleNamespace(runs=[self.old, self.new], dir=None, all=False, json=False,
+                                     strict=False, allow_host_mismatch=False)
+        out = io.StringIO()
+        self.assertEqual(diff_command(Config(), args, out), 1)
+        text = out.getvalue()
+        self.assertIn("PACKAGES (1)\n  pkga 1.0->2.0", text)
+        self.assertIn("EXPLAINED (", text)
+        self.assertNotIn("__pycache__", text)                 # explained items hidden without --all
+
+    def test_no_changes_exits_zero(self):
+        args = types.SimpleNamespace(runs=[self.new, self.new], dir=None, all=False, json=False,
+                                     strict=False, allow_host_mismatch=False)
+        out = io.StringIO()
+        self.assertEqual(diff_command(Config(), args, out), 0)
+        self.assertIn("no changes", out.getvalue())
+
+    def test_audit(self):
+        db = open_runs(self.new)
+        found = {f["path"][len(self.tree):]: f["class"] for f in audit(db, [], False)["findings"]}
+        self.assertEqual(found, {"/usr/bin/other": "alarm", "/usr/bin/mine": "alarm",
+                                 "/etc/app.conf": "notice"})
+        found = {f["path"][len(self.tree):] for f in audit(db, [], True)["findings"]}
+        self.assertIn("/usr/bin/dropped", found)               # only with --unowned
+        self.assertNotIn("/usr/lib/py/__pycache__/m.pyc", found)   # generated is skipped
+
+    def test_audit_applies_rules(self):
+        db = open_runs(self.new)
+        rules = [("ignore", "*/other"), ("notice", "*/mine"), ("alarm", "*/app.conf")]
+        found = {f["path"][len(self.tree):]: (f["class"], f["rule"]) for f in audit(db, rules, False)["findings"]}
+        self.assertNotIn("/usr/bin/other", found)
+        self.assertEqual(found["/usr/bin/mine"][0], "notice")
+        self.assertEqual(found["/etc/app.conf"], ("alarm", "alarm */app.conf (config)"))
+
+    def test_audit_command_json(self):
+        import json
+        args = types.SimpleNamespace(run=self.new, dir=None, unowned=False, json=True, strict=False)
+        out = io.StringIO()
+        self.assertEqual(audit_command(Config(), args, out), 1)
+        data = json.loads(out.getvalue())
+        self.assertEqual(data["run"]["host"], "testhost")
+        self.assertEqual(len(data["setuid"]), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

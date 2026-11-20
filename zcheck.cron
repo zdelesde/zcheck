@@ -1,4 +1,0 @@
-#!/bin/bash
-LATEST=$(date +%Y%m%d-%H%M%S)
-ionice -c3 /usr/local/sbin/zcheck 2> /var/log/zcheck | sort > /var/lib/zcheck/$LATEST 2>&1
-cp /var/lib/zcheck/$LATEST /var/lib/zcheck/latest

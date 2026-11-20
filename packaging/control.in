@@ -1,0 +1,17 @@
+Package: zcheck
+Version: @VERSION@
+Architecture: all
+Maintainer: @MAINTAINER@
+Installed-Size: @INSTALLED_SIZE@
+Depends: python3 (>= 3.8)
+Section: admin
+Priority: optional
+Description: filesystem integrity inventory checked against dpkg metadata
+ zcheck records the files that should only change through packages or
+ configuration management (type, mode, ownership, sha256, link targets),
+ along with the owning dpkg package, whether each file still matches the
+ checksum dpkg recorded at install, and every installed package's version.
+ .
+ `zcheck diff` compares two runs and separates package upgrades from
+ unexplained changes; `zcheck audit` checks one run against package
+ metadata. Runs are stored as one SQLite file each.
