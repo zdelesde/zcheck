@@ -72,8 +72,55 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def note(msg: str) -> None:
-    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}", file=sys.stderr, flush=True)
+class Output:
+    """Where a command's output goes: a stream, or syslog with one line per
+    message at a given level (info, notice, warning, err).
+
+    In syslog mode `compact` is true, so callers can put each item on one
+    line, which greps and alerts much better than multi-line blocks."""
+
+    LEVELS = ("info", "notice", "warning", "err")
+
+    def __init__(self, stream=None, syslog_ident=None):
+        self.stream = stream if stream is not None else sys.stdout
+        self.syslog = None
+        if syslog_ident:
+            import syslog
+            syslog.openlog(ident=syslog_ident, logoption=syslog.LOG_PID, facility=syslog.LOG_USER)
+            self.syslog = syslog
+            self._prio = {"info": syslog.LOG_INFO, "notice": syslog.LOG_NOTICE,
+                          "warning": syslog.LOG_WARNING, "err": syslog.LOG_ERR}
+
+    @property
+    def compact(self) -> bool:
+        return self.syslog is not None
+
+    def emit(self, text: str = "", level: str = "info") -> None:
+        if self.syslog is not None:
+            for line in text.splitlines():
+                if line.strip():
+                    self.syslog.syslog(self._prio[level], line)
+        else:
+            print(text, file=self.stream, flush=True)
+
+
+# Progress and problems (the scan's "starting run", "vanished: ...", etc.).
+# Goes to stderr with a timestamp unless use_syslog() is called.
+_log = Output(stream=sys.stderr)
+
+
+def use_syslog(ident: str = "zcheck") -> Output:
+    """Send progress messages to syslog too; returns an Output for results."""
+    global _log
+    _log = Output(syslog_ident=ident)
+    return _log
+
+
+def note(msg: str, level: str = "info") -> None:
+    if _log.compact:
+        _log.emit(msg, level)
+    else:
+        _log.emit(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}")
 
 
 def ptext(p) -> str:

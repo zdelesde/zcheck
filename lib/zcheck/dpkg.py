@@ -78,7 +78,7 @@ class Dpkg:
             with open(os.path.join(self.admindir, "status"), "rb") as f:
                 data = f.read()
         except OSError as e:
-            note(f"warning: can't read dpkg status: {e}")
+            note(f"warning: can't read dpkg status: {e}", "warning")
             return
         for para in data.split(b"\n\n"):
             fields, conffiles, current = {}, [], None
@@ -120,7 +120,7 @@ class Dpkg:
                         for s in self.spellings(p):
                             self.owner.setdefault(s, set()).add(i)
         except OSError as e:
-            note(f"warning: {path}: {e}")
+            note(f"warning: {path}: {e}", "warning")
 
     def _read_md5sums(self, path: str, i: int) -> None:
         try:
@@ -132,7 +132,7 @@ class Dpkg:
                         for s in self.spellings(p):
                             self.md5.setdefault(s, {})[i] = line[:32].decode()
         except OSError as e:
-            note(f"warning: {path}: {e}")
+            note(f"warning: {path}: {e}", "warning")
 
     def _load_alternatives(self) -> None:
         # One file per group: mode, master link, (slave name, slave link)

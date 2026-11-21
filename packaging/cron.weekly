@@ -1,0 +1,62 @@
+#!/bin/sh
+# /etc/cron.weekly/zcheck - weekly integrity scan, then a diff against the
+# previous run. Installed by the zcheck package as a conffile: local edits are
+# kept on upgrade.
+#
+# Everything is logged to syslog (tag "zcheck"): scan progress, one line per
+# finding, and a summary line. Nothing is printed, so cron sends no mail,
+# unless the diff finds alarms (the full diff is printed) or something fails.
+#
+# Optional /etc/default/zcheck (not shipped):
+#   ZCHECK_WEEKLY=no          skip this job, e.g. where the backup wrapper
+#                             already runs zcheck daily
+#   ZCHECK_ARGS="-c FILE"     options for every zcheck command (default: none)
+#   ZCHECK_DIFF_ARGS=""       extra options for the diff, e.g. --strict
+
+set -u
+
+[ -x /usr/sbin/zcheck ] || exit 0     # package removed, conffile left behind
+
+ZCHECK_WEEKLY=yes
+ZCHECK_ARGS=""
+ZCHECK_DIFF_ARGS=""
+[ -r /etc/default/zcheck ] && . /etc/default/zcheck
+[ "$ZCHECK_WEEKLY" = "no" ] && exit 0
+
+# Don't overlap another scheduled scan holding the same lock.
+LOCK=/run/lock/zcheck.lock
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    echo "zcheck: another run holds $LOCK; skipping this week's scan" >&2
+    exit 0
+fi
+
+# Errors go to stderr as well as syslog, so a failure still reaches cron mail.
+# shellcheck disable=SC2086  # the *_ARGS variables are lists of options
+/usr/sbin/zcheck $ZCHECK_ARGS --syslog scan
+rc=$?
+case $rc in
+    0) ;;
+    1) echo "zcheck: scan finished, but some entries couldn't be read (journalctl -t zcheck)" ;;
+    *) exit $rc ;;
+esac
+
+# shellcheck disable=SC2086
+/usr/sbin/zcheck $ZCHECK_ARGS --syslog diff $ZCHECK_DIFF_ARGS 2>/dev/null
+rc=$?
+case $rc in
+    0) exit 0 ;;
+    1)  # alarms: print the readable version for the mail
+        # shellcheck disable=SC2086
+        /usr/sbin/zcheck $ZCHECK_ARGS diff $ZCHECK_DIFF_ARGS
+        exit 1 ;;
+    *)  # re-run to show the error, unless this is the first run on the host
+        # shellcheck disable=SC2086
+        err=$(/usr/sbin/zcheck $ZCHECK_ARGS diff $ZCHECK_DIFF_ARGS 2>&1)
+        case $err in
+            *"need two runs"*) exit 0 ;;
+        esac
+        echo "zcheck: diff failed (exit $rc):"
+        printf '%s\n' "$err"
+        exit $rc ;;
+esac

@@ -6,7 +6,24 @@ import unittest
 from helpers import TreeCase, write
 from zcheck.compare import (Classifier, audit, audit_command, diff, diff_command, field_changes,
                             open_runs, owner_line)
+from zcheck.common import Output
 from zcheck.config import Config
+
+
+class FakeSyslog:
+    """Stands in for the syslog module: records (level name, line)."""
+    def __init__(self):
+        self.lines = []
+
+    def syslog(self, prio, msg):
+        self.lines.append((prio, msg))
+
+
+def syslog_output():
+    out = Output()
+    out.syslog = FakeSyslog()
+    out._prio = {"info": "info", "notice": "notice", "warning": "warning", "err": "err"}
+    return out
 
 
 def entry(**kw):
@@ -164,7 +181,7 @@ class EndToEnd(TreeCase):
         args = types.SimpleNamespace(runs=[self.old, self.new], dir=None, all=False, json=False,
                                      strict=False, allow_host_mismatch=False)
         out = io.StringIO()
-        self.assertEqual(diff_command(Config(), args, out), 1)
+        self.assertEqual(diff_command(Config(), args, Output(out)), 1)
         text = out.getvalue()
         self.assertIn("PACKAGES (1)\n  pkga 1.0->2.0", text)
         self.assertIn("EXPLAINED (", text)
@@ -174,8 +191,8 @@ class EndToEnd(TreeCase):
         args = types.SimpleNamespace(runs=[self.new, self.new], dir=None, all=False, json=False,
                                      strict=False, allow_host_mismatch=False)
         out = io.StringIO()
-        self.assertEqual(diff_command(Config(), args, out), 0)
-        self.assertIn("no changes", out.getvalue())
+        self.assertEqual(diff_command(Config(), args, Output(out)), 0)
+        self.assertIn("zcheck diff: 0 alarm, 0 notice, 0 explained", out.getvalue())
 
     def test_audit(self):
         db = open_runs(self.new)
@@ -198,11 +215,57 @@ class EndToEnd(TreeCase):
         import json
         args = types.SimpleNamespace(run=self.new, dir=None, unowned=False, json=True, strict=False)
         out = io.StringIO()
-        self.assertEqual(audit_command(Config(), args, out), 1)
+        self.assertEqual(audit_command(Config(), args, Output(out)), 1)
         data = json.loads(out.getvalue())
         self.assertEqual(data["run"]["host"], "testhost")
-        self.assertEqual(len(data["setuid"]), 1)
+        self.assertNotIn("setuid", data)
+
+    def test_diff_to_syslog_is_one_line_per_item(self):
+        args = types.SimpleNamespace(runs=[self.old, self.new], dir=None, all=False, json=False,
+                                     strict=False, allow_host_mismatch=False)
+        out = syslog_output()
+        self.assertEqual(diff_command(Config(), args, out), 1)
+        lines = out.syslog.lines
+        other = [ln for ln in lines if ln[1].startswith("ALARM ~ ") and ln[1].endswith(
+            "/usr/bin/other | changed: content, checksum ok->mismatch | owner: pkgb 1.0 (checksum mismatch)")]
+        self.assertEqual(len(other), 1)
+        self.assertEqual(other[0][0], "warning")
+        self.assertTrue(any(p == "notice" and m.startswith("NOTICE ~ ") for p, m in lines))
+        self.assertFalse(any("__pycache__" in m for _, m in lines))       # explained hidden
+        self.assertIn(("warning", "zcheck diff: 5 alarm, 1 notice, 3 explained"), lines)
+        self.assertFalse(any(m.strip() == "" for _, m in lines))
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AuditSetuid(TreeCase):
+    """Setuid/setgid files in an audit: only problems are listed."""
+
+    def setUp(self):
+        super().setUp()
+        for name in ("ok", "modified", "unverified", "unpackaged"):
+            write(self.t("usr/bin", name), name, 0o4755)
+        self.fake.add("pkg", files=[self.t("usr/bin", n) for n in ("ok", "modified", "unverified")],
+                      md5=[self.t("usr/bin/ok"), self.t("usr/bin/modified")])
+        write(self.t("usr/bin/modified"), "tampered", 0o4755)
+        db = open_runs(self.scan())
+        self.found = {f["path"][len(self.tree):]: f for f in audit(db, [], False)["findings"]}
+
+    def test_unmodified_package_setuid_not_listed(self):
+        self.assertNotIn("/usr/bin/ok", self.found)
+
+    def test_modified_package_setuid_is_alarm(self):
+        f = self.found["/usr/bin/modified"]
+        self.assertEqual(f["class"], "alarm")
+        self.assertIn("setuid/setgid file whose content doesn't match pkg", f["reason"])
+
+    def test_unpackaged_setuid_is_alarm(self):
+        self.assertEqual(self.found["/usr/bin/unpackaged"]["class"], "alarm")
+        self.assertEqual(self.found["/usr/bin/unpackaged"]["owner"], "none")
+
+    def test_unverifiable_package_setuid_is_notice(self):
+        f = self.found["/usr/bin/unverified"]
+        self.assertEqual(f["class"], "notice")
+        self.assertIn("no package checksum", f["reason"])

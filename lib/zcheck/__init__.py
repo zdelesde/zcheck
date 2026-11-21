@@ -7,4 +7,4 @@ Modules:
   compare  classification, diff, audit and the `zcheck-diff` command
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

@@ -15,10 +15,9 @@ import fnmatch
 import json
 import os
 import sqlite3
-import sys
 import urllib.parse
 
-from .common import SCHEMA_VERSION, SETUID_SETGID, ZcheckError, ptext
+from .common import SCHEMA_VERSION, SETUID_SETGID, Output, ZcheckError, ptext
 
 COMPARED = ("type", "mode", "uid", "gid", "sha256", "target", "rdev", "fstype",
             "md5_status", "conffile")
@@ -319,13 +318,22 @@ def audit(db, user_rules: list, show_unowned: bool) -> dict:
                          "owners": own})
 
     for r in db.execute("SELECT * FROM entry WHERE md5_status = 'modified' AND conffile = 0"):
-        add("alarm", r, "content doesn't match {owners}'s package checksum")
+        if r["mode"] & SETUID_SETGID:
+            add("alarm", r, "setuid/setgid file whose content doesn't match {owners}'s package checksum")
+        else:
+            add("alarm", r, "content doesn't match {owners}'s package checksum")
     for r in db.execute("SELECT * FROM entry WHERE type IN ('C', 'B') AND path_text NOT LIKE '/dev/%'"):
         add("alarm", r, "device node outside /dev")
     for r in db.execute(
             "SELECT e.* FROM entry e LEFT JOIN owner w ON w.path = e.path "
             f"WHERE w.path IS NULL AND e.type = 'F' AND (e.mode & {SETUID_SETGID}) != 0"):
         add("alarm", r, "setuid/setgid file that no package owns")
+    # Package-owned, but nothing to verify it against (no md5sums entry, a
+    # local diversion, verify off): can't confirm it's unmodified.
+    for r in db.execute(
+            "SELECT e.* FROM entry e WHERE e.type = 'F' AND e.md5_status IS NULL AND e.conffile = 0 "
+            f"AND (e.mode & {SETUID_SETGID}) != 0 AND EXISTS (SELECT 1 FROM owner w WHERE w.path = e.path)"):
+        add("notice", r, "setuid/setgid file with no package checksum to verify it against")
     for r in db.execute("SELECT * FROM entry WHERE sha256 LIKE '!%'"):
         add("notice", r, "couldn't be hashed")
     for r in db.execute("SELECT * FROM entry WHERE md5_status = 'modified' AND conffile = 1"):
@@ -340,48 +348,66 @@ def audit(db, user_rules: list, show_unowned: bool) -> dict:
                 continue
             add("notice", r, "no package owns this file")
 
-    setuid = []
-    for r in db.execute(f"SELECT * FROM entry WHERE type = 'F' AND (mode & {SETUID_SETGID}) != 0 "
-                        "ORDER BY path"):
-        own = owners(db, "main", r["path"])
-        setuid.append({"path": r["path_text"], "detail": describe(r),
-                       "owner": owner_line(own, pkgs, pkgs, r), "owners": own,
-                       "md5_status": r["md5_status"]})
     findings.sort(key=lambda c: (CLASS_ORDER.index(c["class"]), c["path"]))
-    return {"findings": findings, "setuid": setuid}
+    return {"findings": findings}
 
 
 # ---------------------------------------------------------------------- output
 
-def print_header(title: str, runs: list, out=sys.stdout) -> None:
-    print(title, file=out)
+LEVEL = {"alarm": "warning", "notice": "notice", "explained": "info"}
+SIGIL = {"added": "+", "removed": "-", "changed": "~", "present": "*"}
+LABEL = {"added": "entry:", "removed": "was:", "changed": "changed:", "present": "entry:"}
+
+
+def print_header(title: str, runs: list, out: Output) -> None:
+    lines = []
     for label, r in runs:
-        line = f"  {label}: {r['host']}  {r['started']}  {r['entries']} entries"
+        line = f"{label}: {r['host']}  {r['started']}  {r['entries']} entries"
         if r["errors"] or r["vanished"]:
             line += f"  ({r['errors']} errors, {r['vanished']} vanished)"
         if r["owners"] != "dpkg":
             line += "  [no package data]"
-        print(line, file=out)
+        lines.append(line)
+    if out.compact:
+        out.emit(f"{title}: " + "; ".join(lines))
+    else:
+        out.emit(title)
+        for line in lines:
+            out.emit(f"  {line}")
 
 
-def print_items(items: list, show_explained: bool, out=sys.stdout) -> None:
-    sigil = {"added": "+", "removed": "-", "changed": "~", "present": "*"}
-    label = {"added": "entry:", "removed": "was:", "changed": "changed:", "present": "entry:"}
+def print_items(items: list, show_explained: bool, out: Output) -> None:
     for klass in CLASS_ORDER:
         group = [c for c in items if c["class"] == klass]
         if not group:
             continue
-        print(file=out)
+        level = LEVEL[klass]
         if klass == "explained" and not show_explained:
-            print(f"EXPLAINED ({len(group)}, use --all to list)", file=out)
+            out.emit("" if out.compact else f"\nEXPLAINED ({len(group)}, use --all to list)")
             continue
-        print(f"{klass.upper()} ({len(group)})", file=out)
+        if not out.compact:
+            out.emit(f"\n{klass.upper()} ({len(group)})")
         for c in group:
-            print(f"  {sigil[c['kind']]} {c['path']}", file=out)
-            print(f"      {label[c['kind']]:<9} {c['detail']}", file=out)
-            print(f"      {'owner:':<9} {c['owner']}", file=out)
+            if out.compact:        # one line per item, e.g. for syslog
+                line = (f"{klass.upper()} {SIGIL[c['kind']]} {c['path']} | "
+                        f"{LABEL[c['kind']]} {c['detail']} | owner: {c['owner']}")
+                if c["rule"]:
+                    line += f" | rule: {c['rule']}"
+                out.emit(line, level)
+                continue
+            out.emit(f"  {SIGIL[c['kind']]} {c['path']}")
+            out.emit(f"      {LABEL[c['kind']]:<9} {c['detail']}")
+            out.emit(f"      {'owner:':<9} {c['owner']}")
             if c["rule"]:
-                print(f"      {'rule:':<9} {c['rule']}", file=out)
+                out.emit(f"      {'rule:':<9} {c['rule']}")
+
+
+def print_summary(title: str, items: list, out: Output) -> None:
+    """One closing line with the counts; in syslog it's the line to alert on."""
+    counts = {k: sum(1 for c in items if c["class"] == k) for k in CLASS_ORDER}
+    level = "warning" if counts["alarm"] else ("notice" if counts["notice"] else "info")
+    text = f"{title}: {counts['alarm']} alarm, {counts['notice']} notice, {counts['explained']} explained"
+    out.emit(text if out.compact else f"\n{text}", level)
 
 
 def exit_code(items: list, strict: bool) -> int:
@@ -389,7 +415,8 @@ def exit_code(items: list, strict: bool) -> int:
     return 1 if any(i["class"] in alarming for i in items) else 0
 
 
-def diff_command(cfg, args, out=sys.stdout) -> int:
+def diff_command(cfg, args, out: Output = None) -> int:
+    out = out or Output()
     if len(args.runs) == 2:
         old_path, new_path = args.runs
     elif not args.runs:
@@ -405,38 +432,32 @@ def diff_command(cfg, args, out=sys.stdout) -> int:
     items = diff(db, cls)
     pkg_changes = [cls.pkg_change(p) for p in sorted(cls.changed)]
     if args.json:
-        json.dump({"old": old, "new": new, "packages": pkg_changes, "changes": items}, out, indent=1)
-        print(file=out)
+        out.emit(json.dumps({"old": old, "new": new, "packages": pkg_changes, "changes": items}, indent=1))
     else:
         print_header("zcheck diff", [("old", old), ("new", new)], out)
         if pkg_changes:
-            print(f"\nPACKAGES ({len(pkg_changes)})", file=out)
-            for p in pkg_changes:
-                print(f"  {p}", file=out)
+            if out.compact:
+                out.emit("packages changed: " + "; ".join(pkg_changes))
+            else:
+                out.emit(f"\nPACKAGES ({len(pkg_changes)})")
+                for p in pkg_changes:
+                    out.emit(f"  {p}")
         print_items(items, args.all, out)
-        if not items:
-            print("\nno changes", file=out)
+        print_summary("zcheck diff", items, out)
     return exit_code(items, args.strict)
 
 
-def audit_command(cfg, args, out=sys.stdout) -> int:
+def audit_command(cfg, args, out: Output = None) -> int:
+    out = out or Output()
     path = args.run or os.path.join(args.dir, "latest.db")
     db = open_runs(path)
     info = run_info(db, "main", path)
     result = audit(db, cfg.rules, args.unowned)
     items = result["findings"]
     if args.json:
-        json.dump({"run": info, **result}, out, indent=1)
-        print(file=out)
+        out.emit(json.dumps({"run": info, **result}, indent=1))
     else:
         print_header("zcheck audit", [("run", info)], out)
         print_items(items, True, out)
-        if result["setuid"]:
-            print(f"\nSETUID/SETGID ({len(result['setuid'])})", file=out)
-            for s in result["setuid"]:
-                print(f"  {s['path']}", file=out)
-                print(f"      {'entry:':<9} {s['detail']}", file=out)
-                print(f"      {'owner:':<9} {s['owner']}", file=out)
-        if not items:
-            print("\nnothing to report", file=out)
+        print_summary("zcheck audit", items, out)
     return exit_code(items, args.strict)

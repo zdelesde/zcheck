@@ -9,6 +9,11 @@ zcheck diff [OLD NEW]      compare two runs (default: previous vs latest)
 zcheck audit [RUN]         check one run against package metadata
 ```
 
+The package installs `/etc/cron.weekly/zcheck`, which scans, diffs against the
+previous run, and prints (so cron mails) only alarms or failures. Turn it off
+with `ZCHECK_WEEKLY=no` in `/etc/default/zcheck`, for example where the backup
+wrapper already runs zcheck daily.
+
 Settings and classification rules live in `/etc/zcheck.conf`; an annotated
 example is in `/usr/share/zcheck/zcheck.conf.example`. See
 `zcheck COMMAND --help` for options, output format and exit codes.
@@ -21,6 +26,7 @@ lib/zcheck/           common, config, dpkg, scan, compare, cli
 tests/                unittest suite (make test)
 examples/zcheck.conf  annotated config
 packaging/control.in  Debian control template
+packaging/cron.weekly /etc/cron.weekly/zcheck (a conffile)
 ```
 
 ## Building

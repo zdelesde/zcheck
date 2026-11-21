@@ -82,7 +82,7 @@ class Scanner:
         else:
             kind, msg = "error", str(err)
             self.errors += 1
-            note(f"error: {ptext(path)}: {msg}")
+            note(f"error: {ptext(path)}: {msg}", "warning")
         self.db.execute("INSERT INTO problem VALUES (?, ?, ?)", (ptext(path), kind, msg))
 
     def emit(self, p: bytes, st, type_: str, **kw) -> None:
@@ -242,7 +242,7 @@ def prune_runs(runs_dir: str, keep: int) -> None:
             os.unlink(os.path.join(runs_dir, f))
             note(f"pruned old run {f}")
         except OSError as e:
-            note(f"warning: couldn't prune {f}: {e}")
+            note(f"warning: couldn't prune {f}: {e}", "warning")
 
 
 def scan_command(cfg, args) -> int:
@@ -285,5 +285,6 @@ def scan_command(cfg, args) -> int:
         os.replace(link_tmp, latest)
         prune_runs(runs_dir, args.keep)
 
-    note(f"done: {scanner.entries} entries, {scanner.errors} errors, {scanner.vanished} vanished")
+    note(f"done: {scanner.entries} entries, {scanner.errors} errors, {scanner.vanished} vanished",
+         "warning" if scanner.errors else "info")
     return 1 if scanner.errors else 0

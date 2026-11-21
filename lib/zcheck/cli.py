@@ -5,7 +5,7 @@ import os
 import sys
 
 from . import __version__
-from .common import ZcheckError
+from .common import Output, ZcheckError, note, use_syslog
 from .config import DEFAULT_PATH, Config
 
 SUBCOMMANDS = ("scan", "diff", "audit")
@@ -17,7 +17,10 @@ Filesystem integrity inventory checked against dpkg's package metadata.
   zcheck diff [OLD NEW]         compare two runs (default: previous vs latest)
   zcheck audit [RUN]            check one run against package metadata
 
-Bare `zcheck` (or with only scan options) runs a scan. Settings and
+Bare `zcheck` (or with only scan options) runs a scan. With --syslog, all
+output goes to syslog under the tag "zcheck" instead of the terminal: one
+line per finding at warning (alarm), notice or info level, then a summary
+line with the counts. Errors are also printed to stderr. Settings and
 classification rules are in one file, /etc/zcheck.conf by default; an
 annotated example is /usr/share/zcheck/zcheck.conf.example.
 Run `zcheck COMMAND --help` for each command's options and output.
@@ -43,6 +46,18 @@ so a new mount shows up in the diff. Files that vanish mid-run, for example
 during an apt upgrade, are logged but are not errors.
 
 Exit: 0 clean, 1 some entries couldn't be read, 2 error.
+"""
+
+AUDIT_HELP = """\
+Check one run against package metadata:
+  alarm   files that don't match their package checksum (setuid/setgid ones
+          say so), setuid/setgid files no package owns, and device nodes
+          outside /dev
+  notice  modified conffiles, files that couldn't be hashed, and package
+          setuid/setgid files with no checksum to verify them against
+Unmodified package setuid/setgid files aren't listed. --unowned adds files
+no package owns (outside /etc), for taking inventory.
+
 """
 
 OUTPUT_HELP = """\
@@ -94,6 +109,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help=f"config file (default {DEFAULT_PATH})")
         p.add_argument("-d", "--dir", default=d("/var/lib/zcheck"),
                        help="state directory with runs/ and latest.db (default /var/lib/zcheck)")
+        p.add_argument("--syslog", action="store_true", default=d(False),
+                       help="send all output to syslog (tag zcheck), one line per item; "
+                            "errors also go to stderr")
         return p
 
     ap = argparse.ArgumentParser(prog="zcheck", description=TOP_HELP, formatter_class=fmt,
@@ -119,10 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="compare runs from different hosts (e.g. to check a hot spare for drift)")
 
     a = sub.add_parser("audit", parents=[shared(False)], formatter_class=fmt,
-                       description="Check one run against package metadata: files that don't match "
-                                   "their package checksum, modified conffiles, device nodes outside "
-                                   "/dev, setuid/setgid files no package owns, and the full "
-                                   "setuid/setgid list.\n\n" + OUTPUT_HELP,
+                       description=AUDIT_HELP + OUTPUT_HELP,
                        help="check one run against package metadata")
     a.add_argument("run", nargs="?", metavar="RUN", help="run file (default DIR/latest.db)")
     a.add_argument("--unowned", action="store_true",
@@ -144,6 +159,10 @@ def parse_args(argv):
 def main(argv=None) -> int:
     os.umask(0o077)
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.syslog and getattr(args, "json", False):
+        print("zcheck: --json and --syslog can't be combined", file=sys.stderr)
+        return 2
+    out = use_syslog("zcheck") if args.syslog else Output()
     try:
         cfg = Config.load(args.config)
         if args.command == "scan":
@@ -151,10 +170,12 @@ def main(argv=None) -> int:
             return scan_command(cfg, args)
         from .compare import audit_command, diff_command
         if args.command == "diff":
-            return diff_command(cfg, args)
-        return audit_command(cfg, args)
+            return diff_command(cfg, args, out)
+        return audit_command(cfg, args, out)
     except ZcheckError as e:
         print(f"zcheck: {e}", file=sys.stderr)
+        if args.syslog:
+            note(str(e), "err")
         return 2
     except KeyboardInterrupt:
         return 130
