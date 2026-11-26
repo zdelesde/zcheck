@@ -20,6 +20,12 @@ def md5_of(path) -> str:
         return hashlib.md5(f.read()).hexdigest()
 
 
+def state_prefix(path) -> str:
+    """'TYPE MODE UID:GID' as zcheck describes this file, whoever runs the tests."""
+    st = os.lstat(path)
+    return f"F {st.st_mode & 0o7777:04o} {st.st_uid}:{st.st_gid}"
+
+
 def write(path, data=b"", mode=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as f:

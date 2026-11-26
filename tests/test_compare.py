@@ -3,7 +3,7 @@ import os
 import types
 import unittest
 
-from helpers import TreeCase, write
+from helpers import TreeCase, state_prefix, write
 from zcheck.compare import (Classifier, audit, audit_command, diff, diff_command, field_changes,
                             open_runs, owner_line)
 from zcheck.common import Output
@@ -187,8 +187,9 @@ class EndToEnd(TreeCase):
         self.assertEqual(c["/usr/bin/tool"]["owner"], "pkga 1.0 -> 2.0")
         other = c["/usr/bin/other"]
         self.assertEqual(other["detail"], "content, package checksum")
-        self.assertRegex(other["was"], r"^F 0644 0:0 sha256 \S+, matches package$")
-        self.assertRegex(other["now"], r"^F 0644 0:0 sha256 \S+, differs from package$")
+        prefix = state_prefix(self.t("usr/bin/other"))
+        self.assertRegex(other["was"], rf"^{prefix} sha256 \S+, matches package$")
+        self.assertRegex(other["now"], rf"^{prefix} sha256 \S+, differs from package$")
         self.assertNotEqual(other["was"], other["now"])
 
     def test_diff_command_exit_and_output(self):
@@ -240,15 +241,16 @@ class EndToEnd(TreeCase):
         out = syslog_output()
         self.assertEqual(diff_command(Config(), args, out), 1)
         lines = out.syslog.lines
+        prefix = state_prefix(self.t("usr/bin/other"))
         other = [ln for ln in lines if ln[1].startswith("ALARM ~ changed ") and "/usr/bin/other | changed: "
-                 "content, package checksum | was: F 0644 0:0 sha256 " in ln[1]
+                 f"content, package checksum | was: {prefix} sha256 " in ln[1]
                  and ln[1].endswith(", differs from package | owner: pkgb 1.0")]
         self.assertEqual(len(other), 1)
         self.assertEqual(other[0][0], "warning")
         self.assertTrue(any(p == "notice" and m.startswith("NOTICE ~ changed ") for p, m in lines))
         new = [m for _, m in lines if m.startswith("ALARM + new ") and "/usr/bin/dropped |" in m]
         self.assertEqual(len(new), 1)
-        self.assertIn("| was: (not present) | now: F 0644 0:0 sha256 ", new[0])
+        self.assertIn(f"| was: (not present) | now: {state_prefix(self.t('usr/bin/dropped'))} sha256 ", new[0])
         self.assertFalse(any("__pycache__" in m for _, m in lines))       # explained hidden
         self.assertIn(("warning", "zcheck diff: 5 alarm, 1 notice, 3 explained"), lines)
         self.assertFalse(any(m.strip() == "" for _, m in lines))
@@ -299,6 +301,7 @@ class RemovedPackages(TreeCase):
         self.old_ko = self.t("usr/lib/modules/6.8.0-45/kernel/x.ko")
         self.new_ko = self.t("usr/lib/modules/6.8.0-47/kernel/x.ko")
         write(self.old_ko, "old module")
+        self.old_ko_prefix = state_prefix(self.old_ko)     # before it's deleted
         self.fake.add("linux-modules-6.8.0-45", "6.8.0-45.45", files=[self.old_ko], md5=[self.old_ko])
         self.old = self.scan()
 
@@ -343,7 +346,7 @@ class RemovedPackages(TreeCase):
         self.assertIn("linux-modules-6.8.0-45 removed (config files remain)", text)
         out = io.StringIO()
         diff_command(Config(), types.SimpleNamespace(**{**vars(args), "all": True}), Output(out))
-        self.assertIn("  - deleted  " + self.old_ko + "\n      was:      F 0644 0:0 sha256 ", out.getvalue())
+        self.assertIn(f"  - deleted  {self.old_ko}\n      was:      {self.old_ko_prefix} sha256 ", out.getvalue())
         self.assertIn("\n      now:      (not present)\n", out.getvalue())
 
     def test_purged(self):
