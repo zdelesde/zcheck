@@ -90,9 +90,26 @@ def latest_two(state_dir: str):
     return os.path.join(runs_dir, runs[-2]), os.path.join(runs_dir, runs[-1])
 
 
+# dpkg states (the last word of Status) in which a package's files are gone.
+GONE_STATES = ("config-files", "not-installed")
+
+
+def _state(status) -> str:
+    return status.split()[-1] if status else ""
+
+
 def packages(db, schema: str) -> dict:
-    return {r["name"]: r["version"] for r in db.execute(f"SELECT name, version FROM {schema}.package")
-            if not r["name"].startswith("(")}
+    """{name: version} for packages whose files are installed. A package removed
+    but not purged ("rc": its config files remain) counts as absent, so files
+    that vanished with it are explained like any other removal."""
+    return {r["name"]: r["version"] for r in db.execute(f"SELECT name, version, status FROM {schema}.package")
+            if not r["name"].startswith("(") and _state(r["status"]) not in GONE_STATES}
+
+
+def config_files_only(db, schema: str) -> set:
+    """Packages removed but not purged: only their config files remain."""
+    return {r["name"] for r in db.execute(f"SELECT name, status FROM {schema}.package")
+            if _state(r["status"]) == "config-files"}
 
 
 def owners(db, schema: str, path: bytes) -> list:
@@ -110,41 +127,51 @@ def first_match(rules: list, path: str):
 
 # ------------------------------------------------------------------- formatting
 
+def short_hash(h: str) -> str:
+    return f"{h[:8]}…{h[-4:]}"
+
+
 def describe(e) -> str:
-    """'TYPE MODE UID:GID' plus target, device number or mount type."""
+    """One entry's state: 'TYPE MODE UID:GID', then what identifies its content
+    (hash, link target, device number, mount type) and, for package files,
+    how it compares with the package's checksum."""
     s = f"{e['type']} {e['mode']:04o} {e['uid']}:{e['gid']}"
-    if e["type"] == "L":
+    t = e["type"]
+    if t == "L":
         s += f" -> {ptext(e['target'])}"
-    elif e["type"] in ("C", "B"):
-        s += f" {e['rdev']}"
-    elif e["type"] == "M":
-        s += f" {e['fstype']}"
-    elif e["type"] == "F" and e["sha256"] and e["sha256"].startswith("!"):
-        s += f" (couldn't hash: {e['sha256'][1:]})"
+    elif t in ("C", "B"):
+        s += f" device {e['rdev']}"
+    elif t == "M":
+        s += f" {e['fstype']} (not scanned)"
+    elif t == "D" and e["fstype"]:
+        s += f" ({e['fstype']} mount)"
+    elif t == "F":
+        sha = e["sha256"]
+        if sha is None:
+            s += f" {e['size']} bytes (not hashed)"
+        elif sha.startswith("!"):
+            s += f" (couldn't hash: {sha[1:]})"
+        else:
+            s += f" sha256 {short_hash(sha)}"
+        if e["conffile"]:
+            s += {"ok": ", conffile as packaged", "modified": ", conffile modified"}.get(
+                e["md5_status"], ", conffile")
+        elif e["md5_status"] == "ok":
+            s += ", matches package"
+        elif e["md5_status"] == "modified":
+            s += ", differs from package"
     return s
 
 
+FIELD_NAMES = {"sha256": "content", "rdev": "device", "fstype": "mount type",
+               "md5_status": "package checksum", "conffile": "conffile"}
+
+
 def field_changes(o, n) -> list:
-    out = []
-    for f in COMPARED:
-        a, b = o[f], n[f]
-        if a == b:
-            continue
-        if f == "sha256":
-            out.append("content")
-        elif f == "mode":
-            out.append(f"mode {a:04o}->{b:04o}")
-        elif f == "target":
-            out.append(f"target {ptext(a)}->{ptext(b)}")
-        elif f == "conffile":
-            out.append("became a conffile" if b else "no longer a conffile")
-        elif f == "md5_status":
-            word = {"ok": "ok", "modified": "mismatch", None: "none"}
-            out.append(f"checksum {word[a]}->{word[b]}")
-        else:
-            out.append(f"{f} {a if a is not None else '-'}->{b if b is not None else '-'}")
+    """Names of the fields that differ, in a fixed order."""
+    out = [FIELD_NAMES.get(f, f) for f in COMPARED if o[f] != n[f]]
     if not out and o["size"] != n["size"]:
-        out.append(f"size {o['size']}->{n['size']}")
+        out.append("size")
     return out
 
 
@@ -152,15 +179,17 @@ def fmt_owners(names: list) -> str:
     return ",".join(names) if names else "unowned"
 
 
-def owner_line(names: list, old_pkgs: dict, new_pkgs: dict, e) -> str:
-    """Owning packages with versions, then the package checksum state of entry e."""
+def owner_line(names: list, old_pkgs: dict, new_pkgs: dict) -> str:
+    """Owning packages with their versions ("a -> b" if it changed)."""
     parts = []
     for name in names:
         if name.startswith("("):
             parts.append(name)
             continue
         a, b = old_pkgs.get(name), new_pkgs.get(name)
-        if a == b:
+        if a is None and b is None:
+            parts.append(f"{name} (not installed)")
+        elif a == b:
             parts.append(f"{name} {b}")
         elif a is None:
             parts.append(f"{name} {b} (newly installed)")
@@ -169,27 +198,19 @@ def owner_line(names: list, old_pkgs: dict, new_pkgs: dict, e) -> str:
         else:
             parts.append(f"{name} {a} -> {b}")
     if not parts:
-        text = "none"
-    elif len(parts) > 3:
-        text = ", ".join(parts[:3]) + f", +{len(parts) - 3} more"
-    else:
-        text = ", ".join(parts)
-    if e is not None:
-        if e["conffile"]:
-            state = {"ok": "conffile, as packaged", "modified": "conffile, modified"}.get(
-                e["md5_status"], "conffile")
-            text += f" ({state})"
-        elif e["md5_status"]:
-            text += " (checksum ok)" if e["md5_status"] == "ok" else " (checksum mismatch)"
-    return text
+        return "none"
+    if len(parts) > 3:
+        return ", ".join(parts[:3]) + f", +{len(parts) - 3} more"
+    return ", ".join(parts)
 
 
 # ----------------------------------------------------------------- classifying
 
 class Classifier:
-    def __init__(self, user_rules: list, old_pkgs: dict, new_pkgs: dict):
+    def __init__(self, user_rules: list, old_pkgs: dict, new_pkgs: dict, leftover=frozenset()):
         self.user_rules = user_rules
         self.old_pkgs, self.new_pkgs = old_pkgs, new_pkgs
+        self.leftover = leftover        # removed in the new run, config files remain
         self.changed = {p for p in set(old_pkgs) | set(new_pkgs) if old_pkgs.get(p) != new_pkgs.get(p)}
 
     def pkg_change(self, name: str) -> str:
@@ -197,7 +218,7 @@ class Classifier:
         if a is None:
             return f"{name} installed {b}"
         if b is None:
-            return f"{name} removed"
+            return f"{name} removed" + (" (config files remain)" if name in self.leftover else "")
         return f"{name} {a}->{b}"
 
     def _rule(self, action: str, pattern: str, source: str):
@@ -267,11 +288,13 @@ def diff(db, cls: Classifier) -> list:
         klass, reason, rule = cls.classify(path_text, o, n, own_o, own_n)
         if klass == "ignore":
             return
-        detail = ", ".join(field_changes(o, n)) if kind == "changed" else describe(n if n is not None else o)
+        was = describe(o) if o is not None else None
+        now = describe(n) if n is not None else None
+        detail = ", ".join(field_changes(o, n)) if kind == "changed" else (now or was)
         all_owners = sorted(set(own_o) | set(own_n))
         changes.append({"class": klass, "kind": kind, "path": path_text, "detail": detail,
-                        "owner": owner_line(all_owners, cls.old_pkgs, cls.new_pkgs,
-                                            n if n is not None else o),
+                        "was": was, "now": now,
+                        "owner": owner_line(all_owners, cls.old_pkgs, cls.new_pkgs),
                         "rule": rule, "reason": reason, "owners": all_owners})
 
     for n in db.execute("SELECT n.* FROM main.entry n LEFT JOIN o.entry o ON o.path = n.path "
@@ -313,7 +336,8 @@ def audit(db, user_rules: list, show_unowned: bool) -> dict:
             klass, rule = action, f"{action} {pattern} (config)"
         own = owners(db, "main", row["path"])
         findings.append({"class": klass, "kind": "present", "path": row["path_text"],
-                         "detail": describe(row), "owner": owner_line(own, pkgs, pkgs, row),
+                         "detail": describe(row), "was": None, "now": describe(row),
+                         "owner": owner_line(own, pkgs, pkgs),
                          "rule": rule, "reason": reason.format(owners=fmt_owners(own)),
                          "owners": own})
 
@@ -356,7 +380,8 @@ def audit(db, user_rules: list, show_unowned: bool) -> dict:
 
 LEVEL = {"alarm": "warning", "notice": "notice", "explained": "info"}
 SIGIL = {"added": "+", "removed": "-", "changed": "~", "present": "*"}
-LABEL = {"added": "entry:", "removed": "was:", "changed": "changed:", "present": "entry:"}
+WORD = {"added": "new", "removed": "deleted", "changed": "changed", "present": ""}
+ABSENT = "(not present)"
 
 
 def print_header(title: str, runs: list, out: Output) -> None:
@@ -376,6 +401,27 @@ def print_header(title: str, runs: list, out: Output) -> None:
             out.emit(f"  {line}")
 
 
+def item_heading(c) -> str:
+    """'+ new      /path'; audit items are just '* /path'."""
+    word = WORD[c["kind"]]
+    return f"{SIGIL[c['kind']]} {word:<8} {c['path']}" if word else f"{SIGIL[c['kind']]} {c['path']}"
+
+
+def item_lines(c) -> list:
+    """(label, text) pairs describing one item, in display order. Every diff
+    item has a was: and a now: line, with the missing side '(not present)'."""
+    lines = []
+    if c["kind"] == "changed":
+        lines.append(("changed:", c["detail"]))
+    if c["kind"] != "present":
+        lines.append(("was:", c["was"] or ABSENT))
+    lines.append(("now:", c["now"] or ABSENT))
+    lines.append(("owner:", c["owner"]))
+    if c["rule"]:
+        lines.append(("rule:", c["rule"]))
+    return lines
+
+
 def print_items(items: list, show_explained: bool, out: Output) -> None:
     for klass in CLASS_ORDER:
         group = [c for c in items if c["class"] == klass]
@@ -388,18 +434,14 @@ def print_items(items: list, show_explained: bool, out: Output) -> None:
         if not out.compact:
             out.emit(f"\n{klass.upper()} ({len(group)})")
         for c in group:
+            lines = item_lines(c)
             if out.compact:        # one line per item, e.g. for syslog
-                line = (f"{klass.upper()} {SIGIL[c['kind']]} {c['path']} | "
-                        f"{LABEL[c['kind']]} {c['detail']} | owner: {c['owner']}")
-                if c["rule"]:
-                    line += f" | rule: {c['rule']}"
-                out.emit(line, level)
+                out.emit(f"{klass.upper()} {' '.join(item_heading(c).split(None, 2))} | "
+                         + " | ".join(f"{k} {v}" for k, v in lines), level)
                 continue
-            out.emit(f"  {SIGIL[c['kind']]} {c['path']}")
-            out.emit(f"      {LABEL[c['kind']]:<9} {c['detail']}")
-            out.emit(f"      {'owner:':<9} {c['owner']}")
-            if c["rule"]:
-                out.emit(f"      {'rule:':<9} {c['rule']}")
+            out.emit(f"  {item_heading(c)}")
+            for k, v in lines:
+                out.emit(f"      {k:<9} {v}")
 
 
 def print_summary(title: str, items: list, out: Output) -> None:
@@ -428,7 +470,7 @@ def diff_command(cfg, args, out: Output = None) -> int:
     if old["host"] != new["host"] and not args.allow_host_mismatch:
         raise ZcheckError(f"runs are from different hosts ({old['host']}, {new['host']}); "
                           f"use --allow-host-mismatch to compare anyway")
-    cls = Classifier(cfg.rules, packages(db, "o"), packages(db, "main"))
+    cls = Classifier(cfg.rules, packages(db, "o"), packages(db, "main"), config_files_only(db, "main"))
     items = diff(db, cls)
     pkg_changes = [cls.pkg_change(p) for p in sorted(cls.changed)]
     if args.json:

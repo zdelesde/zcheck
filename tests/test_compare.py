@@ -117,20 +117,30 @@ class Formatting(unittest.TestCase):
     def test_field_changes(self):
         o = entry(md5_status="ok", type="L", target=b"/a")
         n = entry(mode=0o4755, uid=1000, md5_status="modified", type="L", target=b"/b", sha256="b" * 64)
-        self.assertEqual(field_changes(o, n),
-                         ["mode 0644->4755", "uid 0->1000", "content", "target /a->/b",
-                          "checksum ok->mismatch"])
-        self.assertEqual(field_changes(entry(sha256=None, size=1), entry(sha256=None, size=9)), ["size 1->9"])
+        self.assertEqual(field_changes(o, n), ["mode", "uid", "content", "target", "package checksum"])
+        self.assertEqual(field_changes(entry(sha256=None, size=1), entry(sha256=None, size=9)), ["size"])
+
+    def test_describe(self):
+        from zcheck.compare import describe
+        sha = "3f2a91c0" + "0" * 52 + "7b1e"
+        self.assertEqual(describe(entry(mode=0o755, sha256=sha, md5_status="ok")),
+                         "F 0755 0:0 sha256 3f2a91c0…7b1e, matches package")
+        self.assertEqual(describe(entry(sha256=sha, md5_status="modified")),
+                         "F 0644 0:0 sha256 3f2a91c0…7b1e, differs from package")
+        self.assertEqual(describe(entry(sha256=sha, conffile=1, md5_status="modified")),
+                         "F 0644 0:0 sha256 3f2a91c0…7b1e, conffile modified")
+        self.assertEqual(describe(entry(sha256=None, size=42)), "F 0644 0:0 42 bytes (not hashed)")
+        self.assertEqual(describe(entry(type="L", mode=0o777, target=b"/b")), "L 0777 0:0 -> /b")
+        self.assertEqual(describe(entry(type="M", fstype="tmpfs")), "M 0644 0:0 tmpfs (not scanned)")
 
     def test_owner_line(self):
         old, new = {"a": "1", "b": "1", "c": "1"}, {"a": "2", "b": "1", "d": "1"}
-        self.assertEqual(owner_line(["a"], old, new, entry(md5_status="ok")), "a 1 -> 2 (checksum ok)")
-        self.assertEqual(owner_line(["c"], old, new, None), "c 1 (removed)")
-        self.assertEqual(owner_line(["d"], old, new, None), "d 1 (newly installed)")
-        self.assertEqual(owner_line([], old, new, entry()), "none")
-        self.assertEqual(owner_line(["b"], old, new, entry(conffile=1, md5_status="modified")),
-                         "b 1 (conffile, modified)")
-        self.assertEqual(owner_line(["a", "b", "c", "d"], old, new, None),
+        self.assertEqual(owner_line(["a"], old, new), "a 1 -> 2")
+        self.assertEqual(owner_line(["c"], old, new), "c 1 (removed)")
+        self.assertEqual(owner_line(["d"], old, new), "d 1 (newly installed)")
+        self.assertEqual(owner_line([], old, new), "none")
+        self.assertEqual(owner_line(["e"], old, new), "e (not installed)")
+        self.assertEqual(owner_line(["a", "b", "c", "d"], old, new),
                          "a 1 -> 2, b 1, c 1 (removed), +1 more")
 
 
@@ -174,8 +184,12 @@ class EndToEnd(TreeCase):
         for path, klass in expect.items():
             with self.subTest(path=path):
                 self.assertEqual(c[path]["class"], klass)
-        self.assertEqual(c["/usr/bin/tool"]["owner"], "pkga 1.0 -> 2.0 (checksum ok)")
-        self.assertEqual(c["/usr/bin/other"]["detail"], "content, checksum ok->mismatch")
+        self.assertEqual(c["/usr/bin/tool"]["owner"], "pkga 1.0 -> 2.0")
+        other = c["/usr/bin/other"]
+        self.assertEqual(other["detail"], "content, package checksum")
+        self.assertRegex(other["was"], r"^F 0644 0:0 sha256 \S+, matches package$")
+        self.assertRegex(other["now"], r"^F 0644 0:0 sha256 \S+, differs from package$")
+        self.assertNotEqual(other["was"], other["now"])
 
     def test_diff_command_exit_and_output(self):
         args = types.SimpleNamespace(runs=[self.old, self.new], dir=None, all=False, json=False,
@@ -226,11 +240,15 @@ class EndToEnd(TreeCase):
         out = syslog_output()
         self.assertEqual(diff_command(Config(), args, out), 1)
         lines = out.syslog.lines
-        other = [ln for ln in lines if ln[1].startswith("ALARM ~ ") and ln[1].endswith(
-            "/usr/bin/other | changed: content, checksum ok->mismatch | owner: pkgb 1.0 (checksum mismatch)")]
+        other = [ln for ln in lines if ln[1].startswith("ALARM ~ changed ") and "/usr/bin/other | changed: "
+                 "content, package checksum | was: F 0644 0:0 sha256 " in ln[1]
+                 and ln[1].endswith(", differs from package | owner: pkgb 1.0")]
         self.assertEqual(len(other), 1)
         self.assertEqual(other[0][0], "warning")
-        self.assertTrue(any(p == "notice" and m.startswith("NOTICE ~ ") for p, m in lines))
+        self.assertTrue(any(p == "notice" and m.startswith("NOTICE ~ changed ") for p, m in lines))
+        new = [m for _, m in lines if m.startswith("ALARM + new ") and "/usr/bin/dropped |" in m]
+        self.assertEqual(len(new), 1)
+        self.assertIn("| was: (not present) | now: F 0644 0:0 sha256 ", new[0])
         self.assertFalse(any("__pycache__" in m for _, m in lines))       # explained hidden
         self.assertIn(("warning", "zcheck diff: 5 alarm, 1 notice, 3 explained"), lines)
         self.assertFalse(any(m.strip() == "" for _, m in lines))
@@ -269,3 +287,67 @@ class AuditSetuid(TreeCase):
         f = self.found["/usr/bin/unverified"]
         self.assertEqual(f["class"], "notice")
         self.assertIn("no package checksum", f["reason"])
+
+
+class RemovedPackages(TreeCase):
+    """A versioned package replaced by a newer one, as with kernel modules. apt
+    usually leaves the old one in dpkg's database as "deinstall ok
+    config-files" (rc), same version, with its files gone."""
+
+    def setUp(self):
+        super().setUp()
+        self.old_ko = self.t("usr/lib/modules/6.8.0-45/kernel/x.ko")
+        self.new_ko = self.t("usr/lib/modules/6.8.0-47/kernel/x.ko")
+        write(self.old_ko, "old module")
+        self.fake.add("linux-modules-6.8.0-45", "6.8.0-45.45", files=[self.old_ko], md5=[self.old_ko])
+        self.old = self.scan()
+
+        os.unlink(self.old_ko)
+        os.rmdir(os.path.dirname(self.old_ko))
+        write(self.new_ko, "new module")
+
+    def changes(self):
+        db = open_runs(self.new, self.old)
+        from zcheck.compare import config_files_only, packages
+        cls = Classifier([], packages(db, "o"), packages(db, "main"), config_files_only(db, "main"))
+        return cls, {c["path"][len(self.tree):]: c for c in diff(db, cls)}
+
+    def check(self):
+        cls, c = self.changes()
+        removed = c["/usr/lib/modules/6.8.0-45/kernel/x.ko"]
+        self.assertEqual((removed["kind"], removed["class"]), ("removed", "explained"), removed)
+        self.assertIn("linux-modules-6.8.0-45 removed", removed["reason"])
+        added = c["/usr/lib/modules/6.8.0-47/kernel/x.ko"]
+        self.assertEqual(added["class"], "explained", added)
+        self.assertFalse([p for p, x in c.items() if x["class"] == "alarm"], c)
+        return cls
+
+    def test_left_in_config_files_state(self):
+        self.fake.add("linux-modules-6.8.0-45", "6.8.0-45.45", status="deinstall ok config-files")
+        self.fake.add("linux-modules-6.8.0-47", "6.8.0-47.47", files=[self.new_ko], md5=[self.new_ko])
+        self.new = self.scan()
+        cls = self.check()
+        self.assertIn("linux-modules-6.8.0-45 removed (config files remain)",
+                      [cls.pkg_change(p) for p in sorted(cls.changed)])
+
+    def test_deleted_files_hidden_without_all(self):
+        self.fake.add("linux-modules-6.8.0-45", "6.8.0-45.45", status="deinstall ok config-files")
+        self.fake.add("linux-modules-6.8.0-47", "6.8.0-47.47", files=[self.new_ko], md5=[self.new_ko])
+        self.new = self.scan()
+        args = types.SimpleNamespace(runs=[self.old, self.new], dir=None, all=False, json=False,
+                                     strict=False, allow_host_mismatch=False)
+        out = io.StringIO()
+        self.assertEqual(diff_command(Config(), args, Output(out)), 0)
+        text = out.getvalue()
+        self.assertNotIn("6.8.0-45/kernel", text)            # deletions are explained, so hidden
+        self.assertIn("linux-modules-6.8.0-45 removed (config files remain)", text)
+        out = io.StringIO()
+        diff_command(Config(), types.SimpleNamespace(**{**vars(args), "all": True}), Output(out))
+        self.assertIn("  - deleted  " + self.old_ko + "\n      was:      F 0644 0:0 sha256 ", out.getvalue())
+        self.assertIn("\n      now:      (not present)\n", out.getvalue())
+
+    def test_purged(self):
+        del self.fake.packages["linux-modules-6.8.0-45"]
+        self.fake.add("linux-modules-6.8.0-47", "6.8.0-47.47", files=[self.new_ko], md5=[self.new_ko])
+        self.new = self.scan()
+        self.check()

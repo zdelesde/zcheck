@@ -63,24 +63,32 @@ no package owns (outside /etc), for taking inventory.
 OUTPUT_HELP = """\
 Items are grouped under ALARM / NOTICE / EXPLAINED, and each states facts:
 
-  ~ /usr/bin/other
-      changed:  content, checksum ok->mismatch
-      owner:    pkgb 1.0 (checksum mismatch)
+  ~ changed  /usr/bin/other
+      changed:  content, package checksum
+      was:      F 0755 0:0 sha256 3f2a91c0…7b1e, matches package
+      now:      F 0755 0:0 sha256 77b102de…c3a9, differs from package
+      owner:    pkgb 1.0
+  + new      /usr/local/bin/tool
+      was:      (not present)
+      now:      F 0755 0:0 sha256 11507a0e…c437
+      owner:    none
 
-First line: + added, - removed, ~ changed (* in audit), then the path.
-changed: the fields that differ: content (sha256), mode, uid, gid,
-  type, target (symlink), rdev (device number), fstype (mount type),
-  checksum (against the package) and conffile status. For added, removed
-  and audit items this line is entry: or was:, showing "TYPE MODE UID:GID"
-  plus the symlink target, device number or mount type. TYPE is F file,
+First line: "+ new", "- deleted" or "~ changed", then the path. Audit items
+are "* PATH" and have only a now: line.
+changed: which fields differ: type, mode, uid, gid, content (sha256),
+  target (symlink), device, mount type, package checksum, conffile.
+was: / now: the entry before and after; "(not present)" for the side where
+  it didn't exist. Each state is "TYPE MODE UID:GID", then the sha256,
+  symlink target, device number or mount type, then for package files
+  whether the content matches the package's checksum. TYPE is F file,
   L symlink, D directory, M unscanned mount, C/B char/block device, P fifo,
   S socket.
 owner: the owning package(s) and version ("a -> b" if it changed between
-  runs), or "none", then the package checksum or conffile state.
+  runs), or "none".
 rule: shown only when a rule (built-in default or config) decided the class.
 
-In --json output the same facts are "detail", "owner" and "rule", plus a
-"reason" string explaining the class.
+In --json output the same facts are "detail", "was", "now", "owner" and
+"rule", plus a "reason" string explaining the class.
 
 Classes:
   alarm      needs a look: an unexplained change to a package-owned or

@@ -43,8 +43,9 @@ class FakeDpkg:
         self.alternatives = {}
         self.diversions = []
 
-    def add(self, name, version="1.0", files=(), md5=(), conffiles=(), multiarch_same=False):
-        self.packages[name] = dict(version=version, files=list(files),
+    def add(self, name, version="1.0", files=(), md5=(), conffiles=(), multiarch_same=False,
+            status="install ok installed"):
+        self.packages[name] = dict(version=version, files=list(files), status=status,
                                    md5={f: md5_of(f) for f in md5},
                                    conffiles={f: md5_of(f) for f in conffiles},
                                    multiarch_same=multiarch_same)
@@ -65,7 +66,7 @@ class FakeDpkg:
             os.unlink(os.path.join(info, f))
         for name, p in self.packages.items():
             key = f"{name}:amd64" if p["multiarch_same"] else name
-            para = [f"Package: {name}", "Status: install ok installed",
+            para = [f"Package: {name}", f"Status: {p['status']}",
                     "Architecture: amd64", f"Version: {p['version']}"]
             if p["multiarch_same"]:
                 para.append("Multi-Arch: same")
